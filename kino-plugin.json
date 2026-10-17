@@ -1,0 +1,46 @@
+{
+  "id": "gnula",
+  "name": "Gnula",
+  "version": "1.0.0",
+  "apiVersion": 6,
+  "entry": "plugin.js",
+  "icon": "icon.png",
+  "description": "Películas y anime en español desde gnula.one: estrenos, HD y subtítulos, con varios servidores por película (Cuevana, Voe, Filemoon y más).",
+  "author": "baskettv23",
+  "homepage": "https://github.com/baskettv23/kino-plugin-gnula",
+  "hosts": [
+    "www2.gnula.one",
+    "gnula.one",
+    "links.cuevana.ac",
+    "player.cuevana.ac",
+    "player.cuevana3.one",
+    "voe.sx",
+    "filemoon.sx",
+    "waaw.to",
+    "waaw.in",
+    "upstream.to",
+    "hqq.to",
+    "fembed.com",
+    "formatearwindows.net",
+    "streamplay.to",
+    "jawcloud.co",
+    "pelisplushd.net",
+    "player.moovies.in",
+    "fsapi.xyz",
+    "mixdrop.ch",
+    "streamtape.com"
+  ],
+  "capabilities": [
+    "search",
+    "home",
+    "browse",
+    "resolve"
+  ],
+  "categories": [
+    "movies",
+    "anime"
+  ],
+  "color": "#12B3E8",
+  "browser": true,
+  "streamHosts": "any"
+}
