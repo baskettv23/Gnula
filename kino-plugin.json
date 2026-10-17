@@ -16,6 +16,7 @@
     "player.cuevana3.one",
     "voe.sx",
     "filemoon.sx",
+    "filemoon.to",
     "waaw.to",
     "waaw.in",
     "upstream.to",
@@ -28,7 +29,9 @@
     "player.moovies.in",
     "fsapi.xyz",
     "mixdrop.ch",
-    "streamtape.com"
+    "streamtape.com",
+    "dood.pm",
+    "*.2embed.ru"
   ],
   "capabilities": [
     "search",

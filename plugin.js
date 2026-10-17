@@ -1,32 +1,40 @@
 // Kino plugin: Gnula (gnula.one) — películas y anime en español.
 //
 // Hosts declarados: www2.gnula.one (y gnula.one) para el catálogo, y los reproductores externos que la ficha
-// de cada película incluye (links.cuevana.ac, player.cuevana.ac, voe.sx, filemoon.sx, waaw.to). El video final
-// vive en CDNs variables, por eso el manifiesto pide "streamHosts": "any"; y para abrir el reproductor oculto
-// y capturar el .m3u8/.mp4 pide "browser": true (permiso rojo que la persona aprueba al instalar).
+// de cada película incluye. El video final vive en CDNs variables, por eso el manifiesto pide "streamHosts": "any";
+// y para abrir el reproductor oculto y capturar el .m3u8/.mp4 pide "browser": true (permiso rojo que la persona
+// aprueba al instalar).
 //
-// No hay rutas de kino.fetch hacia el video: los reproductores arman la dirección con JavaScript, así que
-// resolve() abre el reproductor en el navegador oculto (kino.browser.capture) y captura la petición de video.
+// La reproducción es modular: cada servidor tiene su extractor (clase) en la sección "Reproducción" —uno simple
+// que lee la fuente del HTML, uno con cabeceras y salto de redirecciones, y el navegador oculto como último
+// recurso— y resolveEmbeds() recorre los enlaces de la ficha hasta que uno rinde; si un servidor falla (caído,
+// timeout, captcha, dominio rotado) se salta al siguiente sin bloquear la app.
 
 const BASE = "https://www2.gnula.one";
 
-// Reproductores preferidos, los que más directo entregan un HLS/mp4 primero. Las páginas "agregadoras"
-// (links.cuevana.ac) que solo listan botones quedan al final.
+// Reproductores preferidos: el orden en que resolveEmbeds() recorre los enlaces de la ficha (los que más
+// directo entregan un HLS/mp4 primero; las páginas "agregadoras" que solo listan botones quedan al final).
+// También es la lista blanca de destinos válidos para encadenar: un iframe o go_to_player() que apunte a un
+// host de aquí se persigue; uno desconocido (publicidad) se ignora.
 const PLAYER_PREF = [
-  "voe.sx", "filemoon.sx", "player.cuevana.ac", "waaw.to", "upstream.to", "hqq.to", "fembed.com",
-  "waaw.in", "streamplay.to", "streamtape.com", "mixdrop.ch", "jawcloud.co", "formatearwindows.net",
-  "fsapi.xyz", "player.moovies.in", "pelisplushd.net", "player.cuevana3.one"
+  "voe.sx", "filemoon.sx", "filemoon.to", "player.cuevana.ac", "dood.pm", "waaw.to", "upstream.to", "hqq.to",
+  "fembed.com", "www.2embed.ru", "waaw.in", "streamplay.to", "streamtape.com", "mixdrop.ch", "jawcloud.co",
+  "formatearwindows.net", "fsapi.xyz", "player.moovies.in", "pelisplushd.net", "player.cuevana3.one"
 ];
 const AGGREGATOR = ["links.cuevana.ac"];
 const PLAYER_NAME = {
   "voe.sx": "Voe",
   "filemoon.sx": "Filemoon",
+  "filemoon.to": "Filemoon",
   "player.cuevana.ac": "Cuevana Player",
   "waaw.to": "Waaw",
   "links.cuevana.ac": "Cuevana",
   "upstream.to": "Upstream",
   "hqq.to": "HQQ",
   "fembed.com": "Fembed",
+  "www.2embed.ru": "2Embed",
+  "2embed.ru": "2Embed",
+  "dood.pm": "Dood",
   "waaw.in": "Waaw",
   "streamplay.to": "Streamplay",
   "streamtape.com": "Streamtape",
@@ -445,53 +453,433 @@ function subsFor(list) {
   return out;
 }
 
-async function captureOne(url, label) {
-  const cap = await kino.browser.capture(url, { timeoutMs: 20000 });
-  const media = cap && cap.media ? cap.media : [];
-  let best = "";
-  for (let i = 0; i < media.length; i++) {
-    if (media[i] && media[i].url && /^https:\/\//.test(media[i].url)) { best = media[i]; break; }
-  }
-  if (!best) throw kino.error("unavailable", "El servidor no entregó un video");
-  const stream = { url: best.url, mime: mimeFor(best.mime, best.url) };
-  if (best.headers && Object.keys(best.headers).length) stream.headers = best.headers;
-  if (label) stream.label = String(label).slice(0, 48);
-  const subs = subsFor(cap.subtitles || []);
-  if (subs.length) stream.subtitles = subs;
-  return stream;
+// ---------- Extractores: un módulo (clase) por servidor ----------
+//
+// BaseExtractor define el contrato —cabeceras, página, stream— y cada extractor sabe llegar al video de
+// su host. resolveEmbeds() recorre los enlaces de la ficha en orden (PLAYER_PREF), pregunta a
+// extractorFor() quién resuelve ese host y ejecuta su extractor; si falla (caído, timeout, captcha,
+// dominio rotado) pasa al siguiente sin bloquear la app. El navegador oculto (BrowserExtractor) es el
+// último recurso de cada enlace: es el único que ejecuta el JavaScript del reproductor y captura la
+// petición real de video con sus cabeceras. Los errores tipados (ExtractorError.code o el code de un
+// error de kino.*) solo alimentan el registro: todo falo salta al siguiente intento.
+
+const UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+const FETCH_TIMEOUT_MS = 6000;      // cada página de reproductor: rápido para no comerse el presupuesto
+const CAPTURE_TIMEOUT_MS = 20000;   // navegador, igual que siempre
+const RESOLVE_BUDGET_MS = 42000;    // resolve con navegador da 75 s en total (la ficha consume ~6)
+const MAX_CHAIN = 6;                // saltos máximos de un enlace encadenado (agregador/iframes)
+
+function originOf(url) {
+  const m = /^(https?:\/\/[^\/?#]+)/.exec(String(url == null ? "" : url));
+  return m ? m[1] : "";
 }
 
-async function tryCapture(opts) {
-  // Se intentan hasta 3 servidores, prefiriendo hosts distintos (una película vieja repite el mismo en cada idioma).
+// ¿El host del enlace está en la lista? Exacto o "*.sufijo", igual que hostMatches del manifiesto.
+function hostIn(url, patterns) {
+  const h = hostOf(url);
+  if (!h) return false;
+  for (let i = 0; i < patterns.length; i++) {
+    const p = patterns[i];
+    if (p.slice(0, 2) === "*.") {
+      if (h.length > p.length - 1 && h.slice(-(p.length - 1)) === p.slice(1)) return true;
+    } else if (h === p) return true;
+  }
+  return false;
+}
+
+class ExtractorError extends Error {
+  constructor(code, message, extractor) {
+    super(message || code);
+    this.name = "ExtractorError";
+    this.code = code;             // timeout|movido|bloqueado|captcha|gone|no_video|down|…
+    this.extractor = extractor || "";
+  }
+}
+
+// Qué pasó, en una palabra, para el registro — ya venga de un extractor o de un error tipado de kino.*.
+function errorKind(e) {
+  const code = e && typeof e.code === "string" ? e.code : "";
+  if (e instanceof ExtractorError) return code;
+  if (code === "timeout") return "timeout";
+  if (code === "host_not_allowed") return "host no declarado";
+  if (code === "browser_unavailable") return "sin navegador";
+  if (code === "blocked" || code === "busy" || code === "not_allowed" || code === "rate_limited") return "bloqueado";
+  if (code === "network" || code === "too_large" || code === "invalid_request") return "red";
+  return code || "desconocido";
+}
+
+// Quita comentarios de JS/CSS: en player.cuevana.ac/e el .m3u8 de ejemplo vive dentro de un /* … */
+// y no vale; sin esto el extractor "directo" creería haber encontrado un video.
+function cleanJs(html) {
+  let s = String(html == null ? "" : html);
+  s = s.replace(/\/\*[\s\S]*?\*\//g, "");
+  s = s.replace(/(^|[^:\w\/])\/\/[^\n]*/g, "$1");
+  return s;
+}
+
+// Una URL solo vale si es https y apunta a un manifiesto de video (o un mp4): evita publicidad
+// y el .mp4 de muestra que algunos reproductores dejan en el HTML.
+function videoUrl(raw) {
+  const u = decodeEntities(String(raw == null ? "" : raw)).replace(/\\\//g, "/").trim();
+  if (u.slice(0, 8) !== "https://") return "";
+  if (!/\.(m3u8|mp4|mpd|m4v)([?#]|$)/i.test(u)) return "";
+  return u;
+}
+
+// Fuente en línea en el HTML del reproductor: "file":"…", sources:[{file:"…"}], src="…m3u8".
+function directSourceIn(html) {
+  const s = cleanJs(html);
+  const pats = [
+    /["'](?:file|src)["']\s*:\s*["'](https?:[^"']+)["']/gi,
+    /src\s*=\s*["'](https?:\/\/[^"']+\.(?:m3u8|mp4|mpd)[^"']*)["']/gi
+  ];
+  for (let i = 0; i < pats.length; i++) {
+    let m;
+    while ((m = pats[i].exec(s))) {
+      const u = videoUrl(m[1]);
+      if (u) return u;
+    }
+  }
+  return "";
+}
+
+function b64Url(v) {
+  try {
+    let t = String(v).replace(/-/g, "+").replace(/_/g, "/");
+    while (t.length % 4) t += "=";
+    return videoUrl(atob(t));
+  } catch (e) {
+    return "";
+  }
+}
+
+// "Desencriptación básica": valores base64 en línea (atob) — el patrón de hosts que esconden su URL
+// codificada en el HTML. Si un host pasa a cifrar con AES, añádelo con aesSource() abajo.
+function decodedSourceIn(html) {
+  const s = cleanJs(html);
+  const re = /atob\(\s*["']([A-Za-z0-9+/_-]{12,}={0,2})["']\s*\)/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const u = b64Url(m[1]);
+    if (u) return u;
+  }
+  return "";
+}
+
+// Plantilla para hosts que guardan su URL cifrada con AES-256-CBC en el HTML: registra el host en
+// AES_HOSTS con su patrón y su clave/iv en hex y el extractor lo usará solo. Ejemplo:
+//   { host: "ejemplo.sx", pattern: /"enc"\s*:\s*"([A-Za-z0-9+/=]+)"/, key: "<64 hex>", iv: "<32 hex>" }
+const AES_HOSTS = [];
+function aesSourceIn(html, cfg) {
+  if (!cfg || !cfg.pattern || !cfg.key) return "";
+  const m = cfg.pattern.exec(String(html == null ? "" : html));
+  if (!m) return "";
+  try {
+    const plain = kino.crypto.decrypt("aes-256-cbc", {
+      key: cfg.key, keyEncoding: "hex",
+      iv: cfg.iv || "", ivEncoding: "hex",
+      data: m[1], inputEncoding: "base64",
+      outputEncoding: "utf8"
+    });
+    return videoUrl(plain);
+  } catch (e) {
+    log("decrypt falló", e && e.code ? e.code : "error");
+    return "";
+  }
+}
+
+// Paso de desencriptado: primero base64 en línea (atob); si el host está en AES_HOSTS, su AES.
+function encodedSourceIn(html, host) {
+  const plain = decodedSourceIn(html);
+  if (plain) return plain;
+  for (let i = 0; i < AES_HOSTS.length; i++) {
+    if (AES_HOSTS[i].host !== host) continue;
+    const u = aesSourceIn(html, AES_HOSTS[i]);
+    if (u) return u;
+  }
+  return "";
+}
+
+function hasCaptcha(html) {
+  return /hcaptcha|grecaptcha|recaptcha\/api|captcha\.google/.test(String(html == null ? "" : html));
+}
+
+// Hacia dónde sigue la página: go_to_player('…') (links.cuevana.ac) o el iframe embebido.
+function embedTargets(html) {
+  const s = String(html == null ? "" : html);
+  const out = [];
+  const push = function (u) {
+    const url = stripHash(decodeEntities(String(u == null ? "" : u)).trim());
+    if (url.slice(0, 8) !== "https://") return;
+    if (out.indexOf(url) < 0) out.push(url);
+  };
+  let m;
+  const gre = /go_to_player\(\s*['"](https?:[^'"]+)['"]\s*\)/g;
+  while ((m = gre.exec(s))) push(m[1]);
+  const ire = /<iframe\b[^>]*?(?:data-lazy-src|data-src|src)\s*=\s*"(https?:[^"]+)"/g;
+  while ((m = ire.exec(s))) push(m[1]);
+  return out;
+}
+
+// Redirección de JavaScript (voe.sx manda a un dominio nuevo con window.location.href = '…').
+function jsRedirect(html) {
+  const m = /(?:window\.|document\.)?location(?:\.href)?\s*=\s*["'](https?:[^"']+)["']/.exec(String(html == null ? "" : html));
+  return m ? decodeEntities(m[1]) : "";
+}
+
+class BaseExtractor {
+  constructor(id, hosts) {
+    this.id = id;
+    this.hosts = hosts || [];
+  }
+
+  matches(url) {
+    return hostIn(url, this.hosts);
+  }
+
+  // El navegador solo manda el origen en referencias cruzadas (strict-origin-when-cross-origin),
+  // así que el Referer va como "https://host/" — lo que el CDN comprueba para no bloquear el hotlink.
+  headers(referer) {
+    const h = { "User-Agent": UA };
+    const ref = referer ? originOf(referer) : "";
+    if (ref) h.Referer = ref + "/";
+    return h;
+  }
+
+  // Página del reproductor. parent = la ficha de gnula de donde vino el iframe (el navegador la
+  // usaría como Referer). kino.fetch nunca lanza por 4xx/5xx: aquí se convierte en fallo tipado.
+  async page(url, opts) {
+    const o = opts || {};
+    const r = await kino.fetch(url, {
+      headers: this.headers(o.parent),
+      timeoutMs: o.timeoutMs || FETCH_TIMEOUT_MS
+    });
+    if (!r.ok) {
+      const st = r.status;
+      const kind = (st === 401 || st === 403 || st === 429) ? "bloqueado"
+        : (st === 404 || st === 410) ? "gone" : st >= 500 ? "down" : "no_video";
+      throw new ExtractorError(kind, "el servidor respondió " + st, this.id);
+    }
+    return r.text();
+  }
+
+  // Stream listo para Kino: el Referer es la página del reproductor (su CDN lo exige) y el
+  // User-Agent el que no dispara el bloqueo por hotlinking. Cabeceras: 2 de 20 permitidas.
+  stream(info) {
+    const out = { url: info.url, mime: mimeFor(info.mime, info.url) };
+    out.headers = this.headers(info.referer || info.url);
+    if (info.label) out.label = String(info.label).slice(0, 48);
+    const subs = subsFor(info.subtitles || []);
+    if (subs.length) out.subtitles = subs;
+    return out;
+  }
+
+  async resolve() {
+    throw new ExtractorError("desconocido", "este extractor no sabe resolver", this.id);
+  }
+}
+
+// Extractor simple: la página entrega el video a la vista ("file":…, sources:[{file:…}], src="…m3u8")
+// o lista a dónde seguir (go_to_player/iframes). Cubre el agregador links.cuevana.ac y la familia de
+// hosts tipo fembed/waaw que dejan su fuente en línea en el HTML.
+class EmbedExtractor extends BaseExtractor {
+  constructor() {
+    super("embed", [
+      "links.cuevana.ac", "fembed.com", "pelisplushd.net", "waaw.to", "waaw.in",
+      "streamplay.to", "jawcloud.co", "player.moovies.in", "fsapi.xyz", "*.2embed.ru"
+    ]);
+  }
+
+  async resolve(embed, ctx) {
+    const html = await this.page(embed.url, { parent: ctx.referer });
+    const direct = directSourceIn(html) || encodedSourceIn(html, hostOf(embed.url));
+    if (direct) return this.stream({ url: direct, label: embed.label, referer: embed.url });
+    const next = embedTargets(html);
+    if (next.length) return { next: next.slice(0, MAX_CHAIN) };
+    if (hasCaptcha(html)) throw new ExtractorError("captcha", "pide captcha y no expuso el video", this.id);
+    throw new ExtractorError("no_video", "la página no expuso el video", this.id);
+  }
+}
+
+// Voe: exige cabeceras correctas y salta por redirección de JavaScript entre dominios; su URL final
+// viene cifrada en el HTML. Sigue la cadena mientras kino.fetch alcance el destino; cuando Voe rota a
+// un dominio que el manifiesto no declara, el fallo tipado deja que el navegador —que sí puede abrir
+// cualquier dominio— termine el trabajo.
+class VoeExtractor extends BaseExtractor {
+  constructor() {
+    super("voe", ["voe.sx", "*.voe.sx"]);
+  }
+
+  async resolve(embed, ctx) {
+    let url = embed.url;
+    let parent = ctx.referer || "";
+    let html = "";
+    for (let hop = 0; hop <= MAX_CHAIN; hop++) {
+      try {
+        html = await this.page(url, { parent: parent || undefined });
+      } catch (e) {
+        if (e && e.code === "host_not_allowed") {
+          throw new ExtractorError("movido", "redirige a " + hostOf(url) + ", que el manifiesto no declara", this.id);
+        }
+        throw e;
+      }
+      const direct = directSourceIn(html) || encodedSourceIn(html, hostOf(url));
+      if (direct) return this.stream({ url: direct, label: embed.label, referer: url });
+      const moved = jsRedirect(html);
+      if (!moved) break;
+      parent = url;
+      url = moved;
+    }
+    if (hasCaptcha(html)) throw new ExtractorError("captcha", "pide captcha y no expuso el video", this.id);
+    throw new ExtractorError("no_video", "la página no expuso el video", this.id);
+  }
+}
+
+// Último recurso de cada enlace: el navegador oculto ejecuta el JavaScript del reproductor y captura
+// la petición real de video con sus cabeceras. Funciona con cualquier host declarado, incluso cuando
+// el reproductor arma la URL en memoria o pasa por varios dominios.
+class BrowserExtractor extends BaseExtractor {
+  constructor() {
+    super("navegador", []);
+  }
+
+  async resolve(embed, ctx) {
+    const opts = { timeoutMs: CAPTURE_TIMEOUT_MS };
+    // El Referer de la ficha solo se manda cuando se conoce (el flujo de película); en un servidor
+    // elegido a mano (ref "srv|…") el navegador abre el embed solo, como antes.
+    if (ctx && ctx.referer) opts.headers = this.headers(ctx.referer);
+    const cap = await kino.browser.capture(embed.url, opts);
+    const media = cap && cap.media ? cap.media : [];
+    let best = "";
+    for (let i = 0; i < media.length; i++) {
+      if (media[i] && media[i].url && /^https:\/\//.test(media[i].url)) { best = media[i]; break; }
+    }
+    if (!best) throw new ExtractorError("no_video", "el navegador no capturó un video", this.id);
+    const stream = { url: best.url, mime: mimeFor(best.mime, best.url) };
+    if (best.headers && Object.keys(best.headers).length) stream.headers = best.headers;
+    if (embed.label) stream.label = String(embed.label).slice(0, 48);
+    const subs = subsFor(cap.subtitles || []);
+    if (subs.length) stream.subtitles = subs;
+    return stream;
+  }
+}
+
+const DIRECT_EXTRACTORS = [new VoeExtractor(), new EmbedExtractor()];
+const BROWSER_EXTRACTOR = new BrowserExtractor();
+
+// Quién resuelve este enlace: su extractor propio, o el navegador como resolutor genérico de todo lo demás.
+function extractorFor(url) {
+  for (let i = 0; i < DIRECT_EXTRACTORS.length; i++) {
+    if (DIRECT_EXTRACTORS[i].matches(url)) return DIRECT_EXTRACTORS[i];
+  }
+  return BROWSER_EXTRACTOR;
+}
+
+// ---------- Lógica central: recorrer los servidores hasta que uno funcione ----------
+
+// Primero un servidor por cada host distinto (una película vieja repite el mismo en cada idioma),
+// luego el resto — los embeds llegan ordenados por PLAYER_PREF desde serverOptions.
+function orderEmbeds(embeds) {
   const order = [];
   const usedHost = new Set();
-  for (let i = 0; i < opts.length && order.length < 3; i++) {
-    const h = hostOf(opts[i].url);
+  for (let i = 0; i < embeds.length && order.length < 3; i++) {
+    const h = hostOf(embeds[i].url);
     if (usedHost.has(h)) continue;
     usedHost.add(h);
     order.push(i);
   }
-  for (let i = 0; i < opts.length && order.length < 3; i++) {
+  for (let i = 0; i < embeds.length; i++) {
     if (order.indexOf(i) < 0) order.push(i);
   }
-  let lastError = null;
-  for (let a = 0; a < order.length; a++) {
-    const idx = order[a];
-    try {
-      const stream = await captureOne(opts[idx].url, opts[idx].label);
-      const rest = [];
-      for (let k = 0; k < opts.length && rest.length < 8; k++) {
-        if (k === idx) continue;
-        rest.push({ label: opts[k].label, ref: "srv|" + opts[k].url });
+  return order;
+}
+
+// Los servidores que no fueron el ganador, como botones manuales ("srv|…"): primero los de la ficha,
+// luego los que reveló un agregador; nunca el ganador ni repetidos, máximo 8.
+function withAlternatives(stream, embeds, chained, winner) {
+  const rest = [];
+  const used = {};
+  used[winner.url] = true;
+  const add = function (list) {
+    for (let i = 0; i < list.length && rest.length < 8; i++) {
+      const u = list[i].url;
+      if (used[u]) continue;
+      used[u] = true;
+      rest.push({ label: list[i].label, ref: "srv|" + u });
+    }
+  };
+  add(embeds);
+  add(chained);
+  if (rest.length) stream.alternatives = rest;
+  return stream;
+}
+
+async function resolveEmbeds(embeds, referer) {
+  if (!embeds.length) {
+    throw kino.error("not_found", "sin reproductores", { userMessage: "No se encontraron servidores para esta película." });
+  }
+  const started = Date.now();
+  const queue = [];
+  const seen = {};
+  const chained = [];
+  const order = orderEmbeds(embeds);
+  for (let i = 0; i < order.length; i++) {
+    const e = embeds[order[i]];
+    seen[e.url] = true;
+    queue.push({ url: e.url, label: e.label, depth: 0 });
+  }
+
+  // Encadenado: lo que un agregador o iframe revela se añade al final de la cola — solo si es un
+  // reproductor conocido (un iframe de publicidad no lleva a ninguna parte útil) y sin repetir.
+  const enqueue = function (urls, from) {
+    if (from.depth >= MAX_CHAIN) return 0;
+    let n = 0;
+    for (let i = 0; i < urls.length && n < MAX_CHAIN; i++) {
+      const u = urls[i];
+      if (seen[u] || u === from.url) continue;
+      if (!hostIn(u, PLAYER_PREF) && !hostIn(u, AGGREGATOR)) continue;
+      seen[u] = true;
+      const label = friendlyHost(u);
+      chained.push({ url: u, label: label });
+      queue.push({ url: u, label: label, depth: from.depth + 1 });
+      n++;
+    }
+    return n;
+  };
+
+  let last = null;
+  while (queue.length) {
+    if (Date.now() - started > RESOLVE_BUDGET_MS) {
+      log("resolve: presupuesto de tiempo agotado, se deja el resto de servidores");
+      break;
+    }
+    const emb = queue.shift();
+    const direct = extractorFor(emb.url);
+    // 1) el extractor del host (fetch directo): si rinde, listo; si falla, se registra y sigue.
+    if (direct !== BROWSER_EXTRACTOR) {
+      try {
+        const out = await direct.resolve(emb, { referer: referer });
+        if (out && Array.isArray(out.next)) {
+          const n = enqueue(out.next, emb);
+          log("resolve: " + hostOf(emb.url) + " encadena a " + n + " reproductor(es)");
+          continue;
+        }
+        return withAlternatives(out, embeds, chained, emb);
+      } catch (e) {
+        last = e;
+        log("resolve: extractor " + direct.id + " en " + hostOf(emb.url) + " falló (" + errorKind(e) + "): " + (e && e.message ? e.message : e));
       }
-      if (rest.length) stream.alternatives = rest;
-      return stream;
+    }
+    // 2) el navegador cierra cada enlace: es el único que ejecuta el JavaScript del reproductor.
+    try {
+      const stream = await BROWSER_EXTRACTOR.resolve(emb, { referer: referer });
+      return withAlternatives(stream, embeds, chained, emb);
     } catch (e) {
-      lastError = e;
-      log("reproductor falló", hostOf(opts[idx].url), e && e.code ? e.code : (e && e.message));
+      last = e;
+      log("resolve: navegador en " + hostOf(emb.url) + " falló (" + errorKind(e) + ")");
     }
   }
-  if (lastError) throw lastError;
+  if (last) throw last;
   throw kino.error("unavailable", "No se pudo reproducir la película");
 }
 
@@ -503,10 +891,11 @@ export async function resolve(ref) {
   const value = cut < 0 ? "" : text.slice(cut + 1);
   if (kind === "srv") {
     if (!/^https:\/\//.test(value)) throw kino.error("not_found", "Servidor inválido");
-    return await captureOne(value, friendlyHost(value));
+    return await resolveEmbeds([{ url: value, label: friendlyHost(value) }], null);
   }
   if (kind !== "movie") throw kino.error("not_found", "Referencia desconocida");
-  const r = await kino.fetch(BASE + "/movie/" + value + "/");
+  const pageUrl = BASE + "/movie/" + value + "/";
+  const r = await kino.fetch(pageUrl, { timeoutMs: FETCH_TIMEOUT_MS });
   if (r.status === 404) {
     throw kino.error("not_found", "gnula ya no tiene esa película", { userMessage: "Esta película ya no está disponible." });
   }
@@ -515,5 +904,5 @@ export async function resolve(ref) {
   if (!opts.length) {
     throw kino.error("not_found", "sin reproductores", { userMessage: "No se encontraron servidores para esta película." });
   }
-  return await tryCapture(opts);
+  return await resolveEmbeds(opts, pageUrl);
 }
