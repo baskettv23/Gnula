@@ -1,11 +1,11 @@
 {
   "id": "gnula",
   "name": "Gnula",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "apiVersion": 6,
   "entry": "plugin.js",
   "icon": "icon.png",
-  "description": "Películas y anime en español desde gnula.one: estrenos, HD y subtítulos, con varios servidores por película (Cuevana, Voe, Filemoon y más).",
+  "description": "Películas y anime en español desde gnula.one: estrenos, HD y subtítulos, con varios servidores por película (Cuevana, Voe, Filemoon y más). Si una película no está en Gnula, la busca en CineHax, Cinecalidad y Pelishax y reproduce desde sus servidores.",
   "author": "baskettv23",
   "homepage": "https://github.com/baskettv23/kino-plugin-gnula",
   "hosts": [
@@ -31,7 +31,17 @@
     "mixdrop.ch",
     "streamtape.com",
     "dood.pm",
-    "*.2embed.ru"
+    "*.2embed.ru",
+    "cinehax.com",
+    "www.cinecalidad.am",
+    "cinecalidad.am",
+    "pelishaxpro.com",
+    "streamwish.to",
+    "vidhidevip.com",
+    "goodstream.one",
+    "vimeos.net",
+    "videoapp.zip",
+    "hlswish.com"
   ],
   "capabilities": [
     "search",

@@ -19,7 +19,8 @@ const BASE = "https://www2.gnula.one";
 const PLAYER_PREF = [
   "voe.sx", "filemoon.sx", "filemoon.to", "player.cuevana.ac", "dood.pm", "waaw.to", "upstream.to", "hqq.to",
   "fembed.com", "www.2embed.ru", "waaw.in", "streamplay.to", "streamtape.com", "mixdrop.ch", "jawcloud.co",
-  "formatearwindows.net", "fsapi.xyz", "player.moovies.in", "pelisplushd.net", "player.cuevana3.one"
+  "formatearwindows.net", "fsapi.xyz", "player.moovies.in", "pelisplushd.net", "player.cuevana3.one",
+  "streamwish.to", "vidhidevip.com", "goodstream.one", "vimeos.net", "videoapp.zip", "hlswish.com"
 ];
 const AGGREGATOR = ["links.cuevana.ac"];
 const PLAYER_NAME = {
@@ -44,7 +45,13 @@ const PLAYER_NAME = {
   "fsapi.xyz": "Fsapi",
   "player.moovies.in": "Moovies",
   "pelisplushd.net": "Pelisplushd",
-  "player.cuevana3.one": "Cuevana 3"
+  "player.cuevana3.one": "Cuevana 3",
+  "streamwish.to": "Streamwish",
+  "vidhidevip.com": "VidHide",
+  "goodstream.one": "Goodstream",
+  "vimeos.net": "Vimeos",
+  "videoapp.zip": "VideoApp",
+  "hlswish.com": "Hlswish"
 };
 
 // Categorías con contenido real en gnula (las que devuelven su propia lista, no la portada).
@@ -352,6 +359,11 @@ export async function search(query) {
   let ranked = kino.rank.sortBySimilarity(items, titles);
   const relevant = kino.rank.filterRelevant(ranked, titles);
   if (relevant.length) ranked = relevant;
+  // Gnula no la tiene: se busca el mismo título en las webs de respaldo y se muestran sus resultados.
+  if (!ranked.length) {
+    const rescued = await fallbackSearch(forms[0], titles);
+    if (rescued.length) return rescued;
+  }
   // ¿Hay más resultados? La paginación de WordPress enlaza a /page/<n>/?s=…
   const hasMore = new RegExp("/page/" + (safePage + 1) + "/").test(lastHtml);
   return hasMore ? { items: ranked, next: String(safePage + 1) } : ranked;
@@ -421,6 +433,7 @@ function serverOptions(html) {
 function withLabels(opts) {
   const counts = {};
   for (let i = 0; i < opts.length; i++) {
+    if (opts[i].label) continue;
     const base = friendlyHost(opts[i].url);
     counts[base] = (counts[base] || 0) + 1;
     opts[i].label = (counts[base] > 1 ? base + " " + counts[base] : base).slice(0, 48);
@@ -485,6 +498,15 @@ function hostIn(url, patterns) {
     } else if (h === p) return true;
   }
   return false;
+}
+
+// Cabeceras del kit para leer una página: UA de navegador y el Referer del origen de la ficha cuando
+// se conoce (el navegador solo manda el origen en referencias cruzadas).
+function pageHeaders(referer) {
+  const h = { "User-Agent": UA };
+  const ref = referer ? originOf(referer) : "";
+  if (ref) h.Referer = ref + "/";
+  return h;
 }
 
 class ExtractorError extends Error {
@@ -640,10 +662,7 @@ class BaseExtractor {
   // El navegador solo manda el origen en referencias cruzadas (strict-origin-when-cross-origin),
   // así que el Referer va como "https://host/" — lo que el CDN comprueba para no bloquear el hotlink.
   headers(referer) {
-    const h = { "User-Agent": UA };
-    const ref = referer ? originOf(referer) : "";
-    if (ref) h.Referer = ref + "/";
-    return h;
+    return pageHeaders(referer);
   }
 
   // Página del reproductor. parent = la ficha de gnula de donde vino el iframe (el navegador la
@@ -686,7 +705,8 @@ class EmbedExtractor extends BaseExtractor {
   constructor() {
     super("embed", [
       "links.cuevana.ac", "fembed.com", "pelisplushd.net", "waaw.to", "waaw.in",
-      "streamplay.to", "jawcloud.co", "player.moovies.in", "fsapi.xyz", "*.2embed.ru"
+      "streamplay.to", "jawcloud.co", "player.moovies.in", "fsapi.xyz", "*.2embed.ru",
+      "streamwish.to", "vidhidevip.com", "goodstream.one", "vimeos.net", "videoapp.zip", "hlswish.com"
     ]);
   }
 
@@ -773,6 +793,273 @@ function extractorFor(url) {
     if (DIRECT_EXTRACTORS[i].matches(url)) return DIRECT_EXTRACTORS[i];
   }
   return BROWSER_EXTRACTOR;
+}
+
+// ---------- Fuentes de respaldo: las otras webs de la ficha ----------
+//
+// La búsqueda y las fichas de Gnula son las principales. Cuando la búsqueda de Gnula no devuelve nada,
+// se busca el mismo título en CineHax, Cinecalidad y Pelishax (ese orden) y se muestran sus resultados;
+// al abrir uno, resolve() lee los servidores de esa web y los pasa al mismo recorrido de extractores que
+// usa Gnula. Cada item guarda su origen en la ref: movie|ch|<id TMDB>, movie|cc|<slug>, movie|px|<id>
+// (movie|slug a secas sigue siendo Gnula).
+
+// El tráiler de YouTube nunca es una opción de reproducción.
+function isTrailer(url) {
+  const h = hostOf(url);
+  return h === "www.youtube.com" || h === "youtube.com" || h === "youtu.be" || h === "youtube-nocookie.com";
+}
+
+// Ordena los servidores como los de Gnula: por la preferencia de PLAYER_PREF, los agregadores al final.
+function rankEmbeds(list) {
+  const rank = function (o) {
+    const i = PLAYER_PREF.indexOf(hostOf(o.url));
+    if (i >= 0) return i;
+    return AGGREGATOR.indexOf(hostOf(o.url)) >= 0 ? 1000 : 500;
+  };
+  return list
+    .map(function (o, i) { return { o: o, i: i }; })
+    .sort(function (a, b) { return rank(a.o) - rank(b.o) || a.i - b.i; })
+    .map(function (x) { return x.o; });
+}
+
+// La URL del póster, a salvo de las rarezas de cada plantilla: Pelishax la guarda dos veces pegada
+// (".../w500/https://image.tmdb.org/..."), Cinecalidad deja un "/" de más y algunas van por http.
+function posterUrl(raw) {
+  let u = decodeEntities(String(raw == null ? "" : raw)).trim();
+  if (!u || u.slice(0, 5) === "data:") return "";
+  if (u.slice(0, 2) === "//") u = "https:" + u;
+  const dup = u.lastIndexOf("http");
+  if (dup > 0) u = u.slice(dup);
+  u = u.replace(/(\/t\/p\/w\d+)\/\//, "$1/").replace(/^http:\/\//, "https://");
+  return /^https:\/\//.test(u) ? u : "";
+}
+
+function sourceItem(src, id, title, poster, year) {
+  const clean = String(title == null ? "" : title).replace(/\s+/g, " ").replace(/^[\s:]+|[\s:]+$/g, "").slice(0, 200);
+  const item = { id: src + "-" + id, ref: "movie|" + src + "|" + id, title: clean, kind: "movie" };
+  if (year) item.year = String(year).slice(0, 4);
+  const img = posterUrl(poster);
+  if (img) item.poster = img.slice(0, 2048);
+  return item;
+}
+
+// CineHax: WordPress con búsqueda en el HTML (/search?q=). Sus servidores salen por AJAX protegido con un
+// nonce que sí viene en la ficha; cuando el AJAX no entrega la URL, el navegador oculto abre la ficha y
+// captura la petición real del reproductor.
+const CINEHAX = {
+  name: "CineHax",
+  base: "https://cinehax.com",
+  async search(q, limit) {
+    const r = await kino.fetch(this.base + "/search?q=" + encodeURIComponent(q), { timeoutMs: FETCH_TIMEOUT_MS });
+    if (!r.ok) throw new ExtractorError("gone", "CineHax respondió " + r.status, "cinehax");
+    const html = r.text();
+    const out = [];
+    const seen = {};
+    const re = /href="\/ver\/\?tipo=pelicula(?:&#038;|&amp;|&)id=(\d+)"[\s\S]{0,800}?<img[^>]*\b(?:data-src|src)="([^"]+)"[^>]*\balt="([^"]*)"/g;
+    let m;
+    while ((m = re.exec(html)) && out.length < limit) {
+      if (seen[m[1]]) continue;
+      seen[m[1]] = true;
+      out.push(sourceItem("ch", m[1], m[3], m[2], ""));
+    }
+    return out;
+  },
+  pageUrl(id) {
+    return this.base + "/ver/?tipo=pelicula&id=" + encodeURIComponent(id);
+  },
+  async servers(id) {
+    const pageUrl = this.pageUrl(id);
+    const r = await kino.fetch(pageUrl, { timeoutMs: FETCH_TIMEOUT_MS });
+    if (r.status === 404) throw new ExtractorError("gone", "CineHax ya no tiene esa película", "cinehax");
+    if (!r.ok) throw new ExtractorError("gone", "CineHax respondió " + r.status, "cinehax");
+    const html = r.text();
+    const embeds = [];
+    const seen = {};
+    const nonce = (/"nonce":"([a-z0-9]+)"/.exec(html) || [])[1] || "";
+    const idxs = html.match(/data-server-idx="\d+"/g) || [];
+    let max = -1;
+    for (let i = 0; i < idxs.length; i++) {
+      const n = parseInt(/(\d+)/.exec(idxs[i])[1], 10);
+      if (n > max) max = n;
+    }
+    for (let s = 0; nonce && s <= max && s < 8; s++) {
+      try {
+        const a = await kino.fetch(this.base + "/wp-admin/admin-ajax.php", {
+          method: "POST",
+          headers: pageHeaders(pageUrl),
+          timeoutMs: FETCH_TIMEOUT_MS,
+          body: { form: { action: "cinehax_get_embed", nonce: nonce, server: s, type: "movie", id: id, season: "", episode: "" } }
+        });
+        const url = a.ok ? embedUrlInJson(a.text()) : "";
+        if (url && !seen[url]) {
+          seen[url] = true;
+          embeds.push({ url: url, label: ("CineHax " + (s + 1)).slice(0, 48) });
+        }
+      } catch (e) {
+        log("cinehax: servidor " + s + " (" + errorKind(e) + ")");
+      }
+    }
+    // Sin URL directa, el navegador abre la ficha: su JavaScript arma el reproductor y lo captura.
+    if (!embeds.length) embeds.push({ url: pageUrl, label: "CineHax" });
+    return { pageUrl: pageUrl, embeds: embeds };
+  }
+};
+
+// Busca la URL del reproductor en la respuesta JSON del AJAX (estructura desconocida): mira las claves
+// habituales y, si hay arreglo de resultados, su primer elemento.
+function embedUrlInJson(text) {
+  let data = null;
+  try { data = JSON.parse(text); } catch (e) { return ""; }
+  const keys = ["url", "embed", "file", "link", "src", "iframe"];
+  const pick = function (v) {
+    if (!v) return "";
+    if (typeof v === "string") return /^https:\/\//.test(v) ? v : "";
+    if (Array.isArray(v)) {
+      for (let i = 0; i < v.length; i++) {
+        const u = pick(v[i]);
+        if (u) return u;
+      }
+      return "";
+    }
+    if (typeof v === "object") {
+      for (let k = 0; k < keys.length; k++) {
+        if (v[keys[k]] != null) {
+          const u = pick(v[keys[k]]);
+          if (u) return u;
+        }
+      }
+    }
+    return "";
+  };
+  return pick(data);
+}
+
+// Cinecalidad: tema dooplay. La ficha trae todos sus servidores en data-option (vimeos, videoapp, voe,
+// goodstream, hlswish, filemoon… y el tráiler de YouTube, que se descarta).
+const CINECALIDAD = {
+  name: "Cinecalidad",
+  base: "https://www.cinecalidad.am",
+  async search(q, limit) {
+    const r = await kino.fetch(this.base + "/?s=" + encodeURIComponent(q), { timeoutMs: FETCH_TIMEOUT_MS });
+    if (!r.ok) throw new ExtractorError("gone", "Cinecalidad respondió " + r.status, "cinecalidad");
+    const html = r.text();
+    const out = [];
+    const seen = {};
+    const re = /data-src="(https?:\/\/[^"]+\.(?:jpg|jpeg|png|webp))"[^>]*\balt="([^"]*)"[\s\S]{0,900}?\/ver-pelicula\/([^"\/]+)\/[\s\S]{0,400}?(?:<p>\s*((?:19|20)\d{2})\s*<\/p>)?/g;
+    let m;
+    while ((m = re.exec(html)) && out.length < limit) {
+      const slug = m[3];
+      if (seen[slug]) continue;
+      seen[slug] = true;
+      out.push(sourceItem("cc", slug, m[2], m[1], m[4] || ""));
+    }
+    return out;
+  },
+  pageUrl(id) {
+    return this.base + "/ver-pelicula/" + encodeURIComponent(id) + "/";
+  },
+  async servers(id) {
+    const pageUrl = this.pageUrl(id);
+    const r = await kino.fetch(pageUrl, { timeoutMs: FETCH_TIMEOUT_MS });
+    if (r.status === 404) throw new ExtractorError("gone", "Cinecalidad ya no tiene esa película", "cinecalidad");
+    if (!r.ok) throw new ExtractorError("gone", "Cinecalidad respondió " + r.status, "cinecalidad");
+    const html = r.text();
+    const embeds = [];
+    const seen = {};
+    const re = /<li[^>]*\bdata-option="(https?:\/\/[^"]+)"[^>]*>/g;
+    let m;
+    while ((m = re.exec(html))) {
+      const url = stripHash(decodeEntities(m[1]).trim());
+      if (!/^https:\/\//.test(url) || isTrailer(url) || seen[url]) continue;
+      seen[url] = true;
+      embeds.push({ url: url, label: friendlyHost(url).slice(0, 48) });
+    }
+    return { pageUrl: pageUrl, embeds: rankEmbeds(embeds) };
+  }
+};
+
+// Pelishax: la web real del grupo (pelishax.com solo reparte el APK). Ficha en /movies/<id de TMDB> con
+// la lista de servidores en li.server-item (data-link y el idioma en data-lang).
+const PELISHAX = {
+  name: "Pelishax",
+  base: "https://pelishaxpro.com",
+  async search(q, limit) {
+    const r = await kino.fetch(this.base + "/search?q=" + encodeURIComponent(q), { timeoutMs: FETCH_TIMEOUT_MS });
+    if (!r.ok) throw new ExtractorError("gone", "Pelishax respondió " + r.status, "pelishax");
+    const html = r.text();
+    const out = [];
+    const seen = {};
+    const re = /<a href="\/movies\/(\d+)"[^>]*>([\s\S]{0,900}?)<\/a>/g;
+    let m;
+    while ((m = re.exec(html)) && out.length < limit) {
+      const id = m[1];
+      if (seen[id]) continue;
+      const chunk = m[2];
+      const img = /\bdata-src="([^"]+)"/.exec(chunk);
+      const alt = /\balt="([^"]*)"/.exec(chunk);
+      const date = /movie-date">\s*((?:19|20)\d{2})\s*</.exec(chunk);
+      seen[id] = true;
+      out.push(sourceItem("px", id, alt ? alt[1] : "", img ? img[1] : "", date ? date[1] : ""));
+    }
+    return out;
+  },
+  pageUrl(id) {
+    return this.base + "/movies/" + encodeURIComponent(id);
+  },
+  async servers(id) {
+    const pageUrl = this.pageUrl(id);
+    const r = await kino.fetch(pageUrl, { timeoutMs: FETCH_TIMEOUT_MS });
+    if (r.status === 404) throw new ExtractorError("gone", "Pelishax ya no tiene esa película", "pelishax");
+    if (!r.ok) throw new ExtractorError("gone", "Pelishax respondió " + r.status, "pelishax");
+    const html = r.text();
+    const embeds = [];
+    const seen = {};
+    const re = /data-link="(https?:\/\/[^"]+)"([\s\S]{0,200}?)data-lang="([^"]*)"/g;
+    let m;
+    while ((m = re.exec(html))) {
+      const url = stripHash(decodeEntities(m[1]).trim());
+      if (!/^https:\/\//.test(url) || isTrailer(url) || seen[url]) continue;
+      const lang = String(m[3]).replace(/\s+/g, " ").trim().slice(0, 18);
+      seen[url] = true;
+      embeds.push({ url: url, label: (friendlyHost(url) + (lang ? " " + lang : "")).slice(0, 48) });
+    }
+    return { pageUrl: pageUrl, embeds: rankEmbeds(embeds) };
+  }
+};
+
+const SOURCES = { ch: CINEHAX, cc: CINECALIDAD, px: PELISHAX };
+const FALLBACK_ORDER = ["ch", "cc", "px"];
+const SOURCE_SHORT = { ch: "CineHax", cc: "Cinecalidad", px: "Pelishax" };
+
+// La búsqueda de respaldo: se prueban las webs en orden, se quitan repetidos (misma película y año) y se
+// ordenan por parecido al título buscado. El nombre de la web se añade al final, ya ordenado.
+async function fallbackSearch(q, titles) {
+  const raw = [];
+  const seen = {};
+  for (let i = 0; i < FALLBACK_ORDER.length && raw.length < SEARCH_MAX; i++) {
+    const key = FALLBACK_ORDER[i];
+    try {
+      const items = await SOURCES[key].search(q, SEARCH_MAX);
+      for (let k = 0; k < items.length; k++) {
+        const it = items[k];
+        const dedupe = squash(it.title) + (it.year || "");
+        if (!it.title || seen[dedupe]) continue;
+        seen[dedupe] = true;
+        raw.push({ it: it, key: key });
+      }
+      log("respaldo " + SOURCES[key].name + ": " + items.length + " resultado(s)");
+    } catch (e) {
+      log("respaldo " + SOURCES[key].name + " falló (" + errorKind(e) + ")");
+    }
+  }
+  if (!raw.length) return [];
+  const ranked = kino.rank.sortBySimilarity(raw.map(function (r) { return r.it; }), titles);
+  const shortOf = {};
+  for (let i = 0; i < raw.length; i++) shortOf[raw[i].it.id] = SOURCE_SHORT[raw[i].key];
+  return ranked.slice(0, SEARCH_MAX).map(function (it) {
+    it.title = (it.title + " · " + shortOf[it.id]).slice(0, 200);
+    return it;
+  });
 }
 
 // ---------- Lógica central: recorrer los servidores hasta que uno funcione ----------
@@ -894,6 +1181,20 @@ export async function resolve(ref) {
     return await resolveEmbeds([{ url: value, label: friendlyHost(value) }], null);
   }
   if (kind !== "movie") throw kino.error("not_found", "Referencia desconocida");
+  // movie|<src>|<id> = una web de respaldo; movie|<slug> a secas = Gnula.
+  const bar = value.indexOf("|");
+  const srcKey = bar < 0 ? "" : value.slice(0, bar);
+  const id = bar < 0 ? value : value.slice(bar + 1);
+  const source = srcKey && Object.prototype.hasOwnProperty.call(SOURCES, srcKey) ? SOURCES[srcKey] : null;
+  if (bar >= 0 && !source) throw kino.error("not_found", "Referencia desconocida");
+  if (source) {
+    if (!id) throw kino.error("not_found", "Referencia desconocida");
+    const got = await source.servers(id);
+    if (!got.embeds.length) {
+      throw kino.error("not_found", "sin reproductores", { userMessage: "No se encontraron servidores para esta película." });
+    }
+    return await resolveEmbeds(withLabels(got.embeds), got.pageUrl);
+  }
   const pageUrl = BASE + "/movie/" + value + "/";
   const r = await kino.fetch(pageUrl, { timeoutMs: FETCH_TIMEOUT_MS });
   if (r.status === 404) {
